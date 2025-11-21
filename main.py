@@ -1,10 +1,21 @@
-# server.py
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
 import os, datetime, threading, wave
 import google.generativeai as genai
+from pymongo import MongoClient
+from bson import ObjectId
 
 app = FastAPI(title="ESP32 Audio Receiver - Gemini STT Server")
+
+# CORS untuk akses dari berbagai origin
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 UPLOAD_FOLDER = "audio_files"
 RAW_FOLDER = "raw_files"
@@ -15,15 +26,30 @@ CHANNELS = 1
 SAMPLE_WIDTH = 2
 SAMPLE_RATE = 16000
 
+# Konfigurasi API Keys
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 if not GEMINI_KEY:
     raise Exception("Set GEMINI_API_KEY env var!")
 
 genai.configure(api_key=GEMINI_KEY)
 
-# Prefer audio-capable model; change if your account supports different name.
-STT_MODEL_NAME = "gemini-2.0-flash-lite-preview-02-05"     
+# MongoDB Atlas Configuration
+MONGODB_URI = os.environ.get("MONGODB_URI")
+if not MONGODB_URI:
+    raise Exception("Set MONGODB_URI env var! Format: mongodb+srv://username:password@cluster.mongodb.net/")
 
+# Connect to MongoDB
+try:
+    mongo_client = MongoClient(MONGODB_URI)
+    db = mongo_client["audio_transcription"]  # Database name
+    recordings_collection = db["recordings"]  # Collection name
+    print("[OK] Connected to MongoDB Atlas")
+except Exception as e:
+    print(f"[ERROR] MongoDB connection failed: {e}")
+    raise
+
+# Gemini Models
+STT_MODEL_NAME = "gemini-2.0-flash-lite-preview-02-05"     
 TEXT_MODEL_NAME = "gemini-flash-latest"
 
 stt_model = genai.GenerativeModel(STT_MODEL_NAME)
@@ -35,6 +61,29 @@ server_status = {
     "last_recording": None
 }
 
+def save_to_mongodb(result_data):
+    """Save transcription result to MongoDB"""
+    try:
+        doc = {
+            "timestamp": datetime.datetime.utcnow(),
+            "english_text": result_data.get("english", ""),
+            "indonesian_text": result_data.get("indonesian", ""),
+            "file_path": result_data.get("file", ""),
+            "success": result_data.get("success", False),
+            "error": result_data.get("error", None),
+            "audio_duration_seconds": result_data.get("duration", 0),
+            "metadata": {
+                "sample_rate": SAMPLE_RATE,
+                "channels": CHANNELS
+            }
+        }
+        insert_result = recordings_collection.insert_one(doc)
+        print(f"[MongoDB] Saved with ID: {insert_result.inserted_id}")
+        return str(insert_result.inserted_id)
+    except Exception as e:
+        print(f"[ERROR] MongoDB save failed: {e}")
+        return None
+
 def process_audio_file(raw_path, wav_path):
     try:
         # read raw pcm16 little-endian produced by ESP32 conversion
@@ -45,6 +94,9 @@ def process_audio_file(raw_path, wav_path):
             print("[ERROR] audio too short:", len(raw))
             return {"success": False, "error": "audio too short"}
 
+        # Calculate duration
+        duration = len(raw) / (SAMPLE_RATE * SAMPLE_WIDTH)
+
         # write WAV header
         with wave.open(wav_path, "wb") as wf:
             wf.setnchannels(CHANNELS)
@@ -52,7 +104,7 @@ def process_audio_file(raw_path, wav_path):
             wf.setframerate(SAMPLE_RATE)
             wf.writeframes(raw)
 
-        print(f"[OK] WAV saved → {wav_path}")
+        print(f"[OK] WAV saved → {wav_path} (duration: {duration:.2f}s)")
 
         # send to Gemini STT (audio-capable model)
         with open(wav_path, "rb") as f:
@@ -75,12 +127,26 @@ def process_audio_file(raw_path, wav_path):
         ind_text = trans_resp.text.strip()
         print("[ID ]", ind_text)
 
-        result = {"success": True, "english": english_text, "indonesian": ind_text, "file": wav_path}
+        result = {
+            "success": True, 
+            "english": english_text, 
+            "indonesian": ind_text, 
+            "file": wav_path,
+            "duration": duration
+        }
+        
+        # Save to MongoDB
+        mongo_id = save_to_mongodb(result)
+        if mongo_id:
+            result["mongo_id"] = mongo_id
+        
         return result
 
     except Exception as e:
         print("[ERROR PROCESS]", repr(e))
-        return {"success": False, "error": str(e)}
+        error_result = {"success": False, "error": str(e)}
+        save_to_mongodb(error_result)
+        return error_result
 
 @app.post("/upload/start")
 async def upload_start():
@@ -88,7 +154,12 @@ async def upload_start():
     raw_path = os.path.join(RAW_FOLDER, f"{file_id}.raw")
     wav_path = os.path.join(UPLOAD_FOLDER, f"record_{file_id}.wav")
     open(raw_path, "wb").close()
-    server_status["uploads"][file_id] = {"raw_path": raw_path, "wav_path": wav_path, "status": "uploading", "result": None}
+    server_status["uploads"][file_id] = {
+        "raw_path": raw_path, 
+        "wav_path": wav_path, 
+        "status": "uploading", 
+        "result": None
+    }
     return {"id": file_id}
 
 @app.post("/upload/chunk/{file_id}")
@@ -129,6 +200,47 @@ async def last_recording():
         return server_status["last_recording"]
     return {"message": "No recordings yet"}
 
+@app.get("/recordings")
+async def get_recordings(limit: int = 10, skip: int = 0):
+    """Get recordings from MongoDB"""
+    try:
+        recordings = list(
+            recordings_collection
+            .find()
+            .sort("timestamp", -1)
+            .skip(skip)
+            .limit(limit)
+        )
+        # Convert ObjectId to string
+        for rec in recordings:
+            rec["_id"] = str(rec["_id"])
+        return {"recordings": recordings, "count": len(recordings)}
+    except Exception as e:
+        raise HTTPException(500, f"Database error: {str(e)}")
+
+@app.get("/recording/{recording_id}")
+async def get_recording(recording_id: str):
+    """Get specific recording by ID"""
+    try:
+        recording = recordings_collection.find_one({"_id": ObjectId(recording_id)})
+        if not recording:
+            raise HTTPException(404, "Recording not found")
+        recording["_id"] = str(recording["_id"])
+        return recording
+    except Exception as e:
+        raise HTTPException(500, f"Database error: {str(e)}")
+
+@app.delete("/recording/{recording_id}")
+async def delete_recording(recording_id: str):
+    """Delete recording from MongoDB"""
+    try:
+        result = recordings_collection.delete_one({"_id": ObjectId(recording_id)})
+        if result.deleted_count == 0:
+            raise HTTPException(404, "Recording not found")
+        return {"ok": True, "message": "Recording deleted"}
+    except Exception as e:
+        raise HTTPException(500, f"Database error: {str(e)}")
+
 @app.get("/download/{filename}")
 async def download_file(filename: str):
     file_path = os.path.join(UPLOAD_FOLDER, filename)
@@ -138,8 +250,26 @@ async def download_file(filename: str):
 
 @app.get("/status")
 async def status():
-    return {"uploads": server_status["uploads"]}
+    return {
+        "uploads": server_status["uploads"],
+        "mongodb_connected": mongo_client is not None
+    }
 
 @app.get("/")
 async def root():
-    return {"message": "Gemini STT Server running"}
+    return {
+        "message": "Gemini STT Server running",
+        "mongodb": "connected",
+        "endpoints": {
+            "upload": "/upload/start, /upload/chunk, /upload/finish",
+            "recordings": "/recordings, /recording/{id}",
+            "last": "/last-recording"
+        }
+    }
+
+@app.on_event("shutdown")
+async def shutdown():
+    """Close MongoDB connection on shutdown"""
+    if mongo_client:
+        mongo_client.close()
+        print("[OK] MongoDB connection closed")
