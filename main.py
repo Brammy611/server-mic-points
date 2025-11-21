@@ -1,220 +1,128 @@
-from fastapi import FastAPI
-import asyncio
-import socket
-import wave
-import datetime
+# server.py
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import JSONResponse
+import os, datetime, threading, wave
 import speech_recognition as sr
 from googletrans import Translator
-import os
-import threading
 
-app = FastAPI(title="ESP32 Audio Receiver - Socket Server")
+app = FastAPI(title="ESP32 Audio Receiver - HTTP Upload Server")
 
-# Konfigurasi
-HOST = '0.0.0.0'
-SOCKET_PORT = 5000
-CHANNELS = 1
-SAMPLE_WIDTH = 2
-SAMPLE_RATE = 16000
 UPLOAD_FOLDER = "audio_files"
+RAW_FOLDER = "raw_files"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(RAW_FOLDER, exist_ok=True)
 
-# Status server
+# audio params (ESP32 PCM)
+CHANNELS = 1
+SAMPLE_WIDTH = 2  # bytes per sample (16-bit)
+SAMPLE_RATE = 16000
+
+# status
 server_status = {
-    "running": False,
-    "connected": False,
-    "recording": False,
+    "running": True,
+    "uploads": {},  # id -> {"raw_path":..., "wav_path":..., "status": "uploading/processing/done", "result": None}
     "last_recording": None
 }
 
-def process_audio(frames, output_file):
-    """Process audio: save, transcribe, translate"""
+def process_audio_file(raw_path, wav_path):
+    """Read raw PCM file, convert to WAV, transcribe and translate."""
     try:
-        # Simpan sebagai WAV
-        with wave.open(output_file, 'wb') as wf:
+        # Read raw bytes
+        with open(raw_path, "rb") as f:
+            raw = f.read()
+
+        # Write proper WAV file
+        with wave.open(wav_path, "wb") as wf:
             wf.setnchannels(CHANNELS)
             wf.setsampwidth(SAMPLE_WIDTH)
             wf.setframerate(SAMPLE_RATE)
-            wf.writeframes(frames)
-        
-        print(f"✅ Audio tersimpan sebagai {output_file}")
-        
+            wf.writeframes(raw)
+
+        print(f"Saved WAV: {wav_path}")
+
         # Speech to text
-        print("🧠 Mengubah suara bahasa Inggris menjadi teks...")
         recognizer = sr.Recognizer()
-        
-        with sr.AudioFile(output_file) as source:
-            audio = recognizer.record(source)
-        
-        try:
-            text_en = recognizer.recognize_google(audio, language="en-US")
-            print("📄 Hasil transkripsi (English):")
-            print(text_en)
-            
-            translator = Translator()
-            translated = translator.translate(text_en, src='en', dest='id').text
-            
-            print("\n🇮🇩 Hasil terjemahan:")
-            print(translated)
-            
-            # Simpan hasil
-            txt_file = output_file.replace('.wav', '_translated.txt')
-            with open(txt_file, "w", encoding="utf-8") as f:
-                f.write("=== English ===\n")
-                f.write(text_en + "\n\n")
-                f.write("=== Indonesian ===\n")
-                f.write(translated)
-            
-            print("💾 File teks disimpan!")
-            
-            return {
-                "success": True,
-                "english": text_en,
-                "indonesian": translated,
-                "file": output_file
-            }
-            
-        except sr.UnknownValueError:
-            print("⚠️ Suara tidak terdeteksi atau tidak bisa dikenali.")
-            return {"success": False, "error": "Speech not recognized"}
-        except sr.RequestError as e:
-            print(f"❌ Error koneksi ke Google Speech API: {e}")
-            return {"success": False, "error": str(e)}
-            
+        with sr.AudioFile(wav_path) as src:
+            audio = recognizer.record(src)
+
+        text_en = recognizer.recognize_google(audio, language="en-US")
+        translator = Translator()
+        translated = translator.translate(text_en, src='en', dest='id').text
+
+        result = {"success": True, "english": text_en, "indonesian": translated, "file": wav_path}
+        print("Transcription:", text_en)
+        print("Translation:", translated)
+
+        return result
+
+    except sr.UnknownValueError:
+        return {"success": False, "error": "Speech not recognized"}
+    except sr.RequestError as e:
+        return {"success": False, "error": f"Speech API error: {e}"}
     except Exception as e:
-        print(f"⚠️ Error processing: {e}")
         return {"success": False, "error": str(e)}
 
-def socket_server_thread():
-    """TCP Socket server running in background thread"""
-    global server_status
-    
-    print("\n" + "="*60)
-    print("🎙 Starting Socket Server...")
-    print("="*60)
-    
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((HOST, SOCKET_PORT))
-    server.listen(1)
-    server.settimeout(1.0)  # Timeout untuk bisa check shutdown
-    
-    server_status["running"] = True
-    print(f"✅ Socket server listening on {HOST}:{SOCKET_PORT}")
-    
-    while server_status["running"]:
-        try:
-            print("\n🎙 Menunggu koneksi ESP32...")
-            conn, addr = server.accept()
-            
-            print(f"✅ Terhubung dari {addr}")
-            server_status["connected"] = True
-            server_status["recording"] = True
-            
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_file = os.path.join(UPLOAD_FOLDER, f"record_{timestamp}.wav")
-            
-            frames = bytearray()
-            
-            try:
-                while True:
-                    data = conn.recv(512)
-                    if not data:
-                        break
-                    frames.extend(data)
-                    
-                    # Progress update setiap 32KB
-                    if len(frames) % 32000 == 0:
-                        print(f"📊 Received: {len(frames)//1024} KB")
-                        
-            except Exception as e:
-                print(f"⚠️ Connection error: {e}")
-            finally:
-                conn.close()
-                server_status["connected"] = False
-                server_status["recording"] = False
-                
-                print(f"\n📊 Total received: {len(frames)} bytes ({len(frames)//1024} KB)")
-                
-                # Process audio
-                if len(frames) > 0:
-                    result = process_audio(frames, output_file)
-                    server_status["last_recording"] = result
-                else:
-                    print("⚠️ No data received")
-                    
-        except socket.timeout:
-            continue
-        except Exception as e:
-            print(f"❌ Server error: {e}")
-            break
-    
-    server.close()
-    print("🛑 Socket server stopped")
+@app.post("/upload/start")
+async def upload_start():
+    """Start new upload session, return an id."""
+    file_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    raw_path = os.path.join(RAW_FOLDER, f"{file_id}.raw")
+    wav_path = os.path.join(UPLOAD_FOLDER, f"record_{file_id}.wav")
+    # create empty raw file
+    open(raw_path, "wb").close()
+    server_status["uploads"][file_id] = {"raw_path": raw_path, "wav_path": wav_path, "status": "uploading", "result": None}
+    return {"id": file_id}
 
-# Start socket server in background
-socket_thread = threading.Thread(target=socket_server_thread, daemon=True)
-socket_thread.start()
+@app.post("/upload/chunk/{file_id}")
+async def upload_chunk(file_id: str, chunk: UploadFile = File(...)):
+    """Append a chunk of raw PCM bytes to the raw file. Expect raw binary body."""
+    if file_id not in server_status["uploads"]:
+        raise HTTPException(status_code=404, detail="file_id not found")
+    info = server_status["uploads"][file_id]
+    raw_path = info["raw_path"]
+    # append received bytes
+    try:
+        body = await chunk.read()
+        with open(raw_path, "ab") as f:
+            f.write(body)
+        return {"ok": True, "received_bytes": len(body)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-# FastAPI endpoints
-@app.get("/")
-async def root():
-    return {
-        "status": "online",
-        "message": "ESP32 Audio Receiver - Socket Server",
-        "socket_server": {
-            "host": HOST,
-            "port": SOCKET_PORT,
-            "running": server_status["running"],
-            "connected": server_status["connected"],
-            "recording": server_status["recording"]
-        },
-        "endpoints": {
-            "/health": "GET - Check server health",
-            "/status": "GET - Get socket server status",
-            "/last-recording": "GET - Get last recording result"
-        }
-    }
+@app.post("/upload/finish/{file_id}")
+async def upload_finish(file_id: str):
+    """Finish upload: convert & process in background thread."""
+    if file_id not in server_status["uploads"]:
+        raise HTTPException(status_code=404, detail="file_id not found")
+    info = server_status["uploads"][file_id]
+    if info["status"] != "uploading":
+        return {"ok": False, "message": "Already finished or processing"}
 
-@app.get("/health")
-async def health():
-    return {
-        "status": "healthy",
-        "socket_server_running": server_status["running"],
-        "timestamp": datetime.datetime.now().isoformat()
-    }
+    info["status"] = "processing"
 
-@app.get("/status")
-async def status():
-    return {
-        "socket_server": server_status,
-        "timestamp": datetime.datetime.now().isoformat()
-    }
+    def job():
+        res = process_audio_file(info["raw_path"], info["wav_path"])
+        info["result"] = res
+        info["status"] = "done"
+        server_status["last_recording"] = res
+
+    t = threading.Thread(target=job, daemon=True)
+    t.start()
+
+    return {"ok": True, "message": "processing started"}
 
 @app.get("/last-recording")
 async def last_recording():
     if server_status["last_recording"]:
         return server_status["last_recording"]
-    else:
-        return {"message": "No recordings yet"}
+    return {"message": "No recordings yet"}
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Cleanup on shutdown"""
-    print("\n🛑 Shutting down socket server...")
-    server_status["running"] = False
-    socket_thread.join(timeout=5)
+@app.get("/status")
+async def status():
+    return {"uploads": server_status["uploads"]}
 
+# Run with uvicorn on PORT env
 if __name__ == "__main__":
-    import uvicorn
-    # Get port from environment or use 8000
-    http_port = int(os.environ.get("PORT", 8000))
-    
-    print("\n" + "="*60)
-    print("🚀 Starting Hybrid Server")
-    print("="*60)
-    print(f"📡 HTTP API: http://0.0.0.0:{http_port}")
-    print(f"🔌 Socket Server: tcp://0.0.0.0:{SOCKET_PORT}")
-    print("="*60 + "\n")
-    
-    uvicorn.run(app, host="0.0.0.0", port=http_port)
+    import uvicorn, os
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
