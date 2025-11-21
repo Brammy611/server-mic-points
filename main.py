@@ -5,6 +5,9 @@ import google.generativeai as genai
 
 app = FastAPI(title="ESP32 Audio Receiver - Gemini STT Server")
 
+# ======================================
+# 📂 FOLDERS
+# ======================================
 UPLOAD_FOLDER = "audio_files"
 RAW_FOLDER = "raw_files"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -15,16 +18,23 @@ SAMPLE_WIDTH = 2
 SAMPLE_RATE = 16000
 
 # ======================================
-# 🔑 Load Gemini API Key
+# 🔑 GEMINI API KEY
 # ======================================
-genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
+api_key = os.environ.get("GEMINI_API_KEY")
+if not api_key:
+    raise Exception("GEMINI_API_KEY environment variable is NOT set!")
+
+genai.configure(api_key=api_key)
 
 # Model untuk Speech-to-Text
 stt_model = genai.GenerativeModel("gemini-2.0-flash-lite-preview-02-05")
 
-# Model untuk terjemahan / text
+# Model untuk translate
 text_model = genai.GenerativeModel("gemini-flash-latest")
 
+# ======================================
+# 🧠 SERVER STATE
+# ======================================
 server_status = {
     "running": True,
     "uploads": {},
@@ -32,11 +42,11 @@ server_status = {
 }
 
 # ======================================
-# 🔊 AUDIO PROCESSING
+# 🔊 AUDIO PROCESS
 # ======================================
 def process_audio_file(raw_path, wav_path):
     try:
-        # Convert RAW → WAV
+        # RAW → WAV
         with open(raw_path, "rb") as f:
             raw_data = f.read()
 
@@ -48,21 +58,22 @@ def process_audio_file(raw_path, wav_path):
 
         print(f"[OK] WAV saved → {wav_path}")
 
-        # --- SPEECH TO TEXT (English) ---
+        # --- STT with Gemini ---
         with open(wav_path, "rb") as f:
+            audio_bytes = f.read()
             response = stt_model.generate_content(
                 contents=[
-                    {"mime_type": "audio/wav", "data": f.read()},
-                    "Transcribe this audio into English."
+                    {"mime_type": "audio/wav", "data": audio_bytes},
+                    "Transcribe the audio into English only."
                 ]
             )
 
         english_text = response.text
         print("[STT]", english_text)
 
-        # --- TRANSLATION TO INDONESIAN ---
+        # --- TRANSLATE ---
         translation = text_model.generate_content(
-            f"Translate this to Indonesian:\n\n{english_text}"
+            f"Translate this to Indonesian:\n{english_text}"
         ).text
 
         print("[ID ]", translation)
@@ -91,7 +102,6 @@ async def upload_start():
     raw_path = os.path.join(RAW_FOLDER, f"{file_id}.raw")
     wav_path = os.path.join(UPLOAD_FOLDER, f"record_{file_id}.wav")
 
-    # Buat file RAW kosong
     open(raw_path, "wb").close()
 
     server_status["uploads"][file_id] = {
@@ -131,11 +141,10 @@ async def upload_finish(file_id: str):
     info = server_status["uploads"][file_id]
 
     if info["status"] != "uploading":
-        return {"ok": False, "message": "Already processed"}
+        return {"ok": False, "message": "already processed"}
 
     info["status"] = "processing"
 
-    # Proses di background thread
     def job():
         result = process_audio_file(info["raw_path"], info["wav_path"])
         info["result"] = result
@@ -151,16 +160,24 @@ async def upload_finish(file_id: str):
 async def last_recording():
     if server_status["last_recording"]:
         return server_status["last_recording"]
-    return {"message": "No recordings yet"}
+    return {"message": "no recordings yet"}
 
 
 @app.get("/download/{filename}")
 async def download_file(filename: str):
-    file_path = f"audio_files/{filename}"
+    file_path = f"{UPLOAD_FOLDER}/{filename}"
+    if not os.path.exists(file_path):
+        raise HTTPException(404, "file not found")
     return FileResponse(file_path, filename=filename)
 
 
 @app.get("/status")
 async def status():
     return {"uploads": server_status["uploads"]}
+
+
+@app.get("/")
+async def home():
+    return {"message": "Gemini STT Server Running"}
+
 
