@@ -90,9 +90,11 @@ def process_audio_file(raw_path, wav_path):
         with open(raw_path, "rb") as f:
             raw = f.read()
 
-        if len(raw) < SAMPLE_RATE * 1 * 2:  # <1 second (safety)
-            print("[ERROR] audio too short:", len(raw))
-            return {"success": False, "error": "audio too short"}
+        # Minimal 1.5 detik audio (16000 Hz * 2 bytes * 1.5 seconds)
+        min_bytes = int(SAMPLE_RATE * SAMPLE_WIDTH * 1.5)
+        if len(raw) < min_bytes:
+            print(f"[ERROR] audio too short: {len(raw)} bytes ({len(raw)/(SAMPLE_RATE*SAMPLE_WIDTH):.2f}s), need at least {min_bytes} bytes (1.5s)")
+            return {"success": False, "error": f"audio too short: {len(raw)/(SAMPLE_RATE*SAMPLE_WIDTH):.2f}s, need at least 1.5s"}
 
         # Calculate duration
         duration = len(raw) / (SAMPLE_RATE * SAMPLE_WIDTH)
@@ -180,18 +182,25 @@ async def upload_chunk(file_id: str, request: Request):
 
 @app.post("/upload/finish/{file_id}")
 async def upload_finish(file_id: str):
+    print(f"[FINISH] Received finish request for file_id: {file_id}")
     if file_id not in server_status["uploads"]:
+        print(f"[FINISH ERROR] file_id not found: {file_id}")
         raise HTTPException(404, "file_id not found")
     info = server_status["uploads"][file_id]
     if info["status"] != "uploading":
+        print(f"[FINISH] Already processed, status: {info['status']}")
         return {"ok": False, "message": "already processed"}
     info["status"] = "processing"
+    print(f"[FINISH] Starting processing thread for {file_id}")
     def job():
+        print(f"[PROCESSING] Starting audio processing for {file_id}")
         res = process_audio_file(info["raw_path"], info["wav_path"])
         info["result"] = res
         info["status"] = "done"
         server_status["last_recording"] = res
+        print(f"[PROCESSING] Finished processing {file_id}, result: {res.get('success', False)}")
     threading.Thread(target=job, daemon=True).start()
+    print(f"[FINISH] Processing thread started for {file_id}")
     return {"ok": True, "message": "processing started"}
 
 @app.get("/last-recording")
