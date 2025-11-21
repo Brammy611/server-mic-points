@@ -1,5 +1,5 @@
 # server.py
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.responses import JSONResponse
 import os, datetime, threading, wave
 import speech_recognition as sr
@@ -74,18 +74,19 @@ async def upload_start():
     return {"id": file_id}
 
 @app.post("/upload/chunk/{file_id}")
-async def upload_chunk(file_id: str, chunk: UploadFile = File(...)):
-    """Append a chunk of raw PCM bytes to the raw file. Expect raw binary body."""
+async def upload_chunk(file_id: str, request: Request):
     if file_id not in server_status["uploads"]:
         raise HTTPException(status_code=404, detail="file_id not found")
+
     info = server_status["uploads"][file_id]
     raw_path = info["raw_path"]
-    # append received bytes
+
     try:
-        body = await chunk.read()
+        body = await request.body()  # raw bytes from ESP32
         with open(raw_path, "ab") as f:
             f.write(body)
         return {"ok": True, "received_bytes": len(body)}
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -126,3 +127,4 @@ if __name__ == "__main__":
     import uvicorn, os
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
