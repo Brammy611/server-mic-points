@@ -1,0 +1,5 @@
+=== English ===
+hello Hello Kitty
+
+=== Indonesian ===
+halo Hello Kitty
