@@ -90,11 +90,13 @@ def process_audio_file(raw_path, wav_path):
         with open(raw_path, "rb") as f:
             raw = f.read()
 
-        # Minimal 1.5 detik audio (16000 Hz * 2 bytes * 1.5 seconds)
-        min_bytes = int(SAMPLE_RATE * SAMPLE_WIDTH * 1.5)
+        # TEMPORARY: Very low threshold for testing
+        min_bytes = 3000  # ~0.1 seconds - just for testing
         if len(raw) < min_bytes:
-            print(f"[ERROR] audio too short: {len(raw)} bytes ({len(raw)/(SAMPLE_RATE*SAMPLE_WIDTH):.2f}s), need at least {min_bytes} bytes (1.5s)")
-            return {"success": False, "error": f"audio too short: {len(raw)/(SAMPLE_RATE*SAMPLE_WIDTH):.2f}s, need at least 1.5s"}
+            print(f"[ERROR] audio too short: {len(raw)} bytes ({len(raw)/(SAMPLE_RATE*SAMPLE_WIDTH):.2f}s), need at least {min_bytes} bytes")
+            error_result = {"success": False, "error": f"audio too short: {len(raw)/(SAMPLE_RATE*SAMPLE_WIDTH):.2f}s"}
+            save_to_mongodb(error_result)
+            return error_result
 
         # Calculate duration
         duration = len(raw) / (SAMPLE_RATE * SAMPLE_WIDTH)
@@ -205,8 +207,12 @@ async def upload_finish(file_id: str):
 
 @app.get("/last-recording")
 async def last_recording():
+    print(f"[LAST-RECORDING] Request received")
     if server_status["last_recording"]:
-        return server_status["last_recording"]
+        result = server_status["last_recording"]
+        print(f"[LAST-RECORDING] Returning result: success={result.get('success', False)}")
+        return result
+    print(f"[LAST-RECORDING] No recordings yet")
     return {"message": "No recordings yet"}
 
 @app.get("/recordings")
