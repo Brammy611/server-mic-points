@@ -20,7 +20,7 @@ SAMPLE_RATE = 16000
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 
 # Model untuk Speech-to-Text
-stt_model = genai.GenerativeModel("gemini-2.5-flash-native-audio-latest")
+stt_model = genai.GenerativeModel("gemini-2.0-flash-lite-preview-02-05")
 
 # Model untuk terjemahan / text
 text_model = genai.GenerativeModel("gemini-flash-latest")
@@ -163,3 +163,4 @@ async def download_file(filename: str):
 @app.get("/status")
 async def status():
     return {"uploads": server_status["uploads"]}
+
