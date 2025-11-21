@@ -1,6 +1,6 @@
 # server.py
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 import os, datetime, threading, wave
 import speech_recognition as sr
 from googletrans import Translator
@@ -118,6 +118,11 @@ async def last_recording():
         return server_status["last_recording"]
     return {"message": "No recordings yet"}
 
+@app.get("/download/{filename}")
+def download_file(filename: str):
+    file_path = f"audio_files/{filename}"
+    return FileResponse(path=file_path, filename=filename, media_type="audio/wav")
+    
 @app.get("/status")
 async def status():
     return {"uploads": server_status["uploads"]}
@@ -127,4 +132,5 @@ if __name__ == "__main__":
     import uvicorn, os
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
 
